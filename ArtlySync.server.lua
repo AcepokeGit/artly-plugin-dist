@@ -41,7 +41,7 @@ local LOCAL_APP_ID = "artly-desktop"
 local ARTLY_LOGO_ASSET_ID = 128261725346695
 
 -- Bump on every published update (shown in the panel footer).
-local PLUGIN_VERSION = "1.3.0"
+local PLUGIN_VERSION = "1.4.0"
 
 ---------------------------------------------------------------------------
 -- State
@@ -130,7 +130,7 @@ local INPUT_BG    = Color3.fromRGB(20, 20, 20)
 local TRACK_BG    = Color3.fromRGB(33, 33, 33)   -- usage-bar track (~zinc-800)
 local STROKE      = Color3.fromRGB(255, 255, 255)
 local STROKE_TRANS = 0.85                         -- ~white/15
-local CORNER      = 4                              -- corner radius everywhere
+local CORNER      = 0                              -- square corners everywhere (matches the app's clean look)
 local TEXT        = Color3.fromRGB(236, 237, 241)
 local TEXT_DIM    = Color3.fromRGB(150, 153, 161)
 local TEXT_FAINT  = Color3.fromRGB(110, 113, 122)
@@ -339,14 +339,14 @@ local function makeUsageBar(parent, order, title, titleColor, fillA, fillB)
 	track.BorderSizePixel = 0
 	track.LayoutOrder = 2
 	track.Parent = wrap
-	addCorner(track, 999)
+	addCorner(track, 0)
 
 	local fill = Instance.new("Frame")
 	fill.Size = UDim2.new(0, 0, 1, 0)
 	fill.BackgroundColor3 = fillB
 	fill.BorderSizePixel = 0
 	fill.Parent = track
-	addCorner(fill, 999)
+	addCorner(fill, 0)
 	local fillGrad = Instance.new("UIGradient")
 	fillGrad.Color = ColorSequence.new(fillA, fillB)
 	fillGrad.Parent = fill
