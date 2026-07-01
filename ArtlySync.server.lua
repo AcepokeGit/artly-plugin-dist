@@ -17,6 +17,9 @@
 
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
+-- Used to push script Source changes so an OPEN Studio script editor updates live
+-- (a plain `script.Source = …` does not refresh the open document). See setInstanceProperty.
+local ScriptEditorService = game:GetService("ScriptEditorService")
 
 ---------------------------------------------------------------------------
 -- Config
@@ -41,7 +44,7 @@ local LOCAL_APP_ID = "artly-desktop"
 local ARTLY_LOGO_ASSET_ID = 128261725346695
 
 -- Bump on every published update (shown in the panel footer).
-local PLUGIN_VERSION = "1.4.0"
+local PLUGIN_VERSION = "1.5.1"
 
 ---------------------------------------------------------------------------
 -- State
@@ -1085,6 +1088,19 @@ local function setInstanceProperty(instance, propName, propValue)
 	if propName == "Font" and typeof(value) == "Font" then
 		propName = "FontFace"
 	end
+	-- Script source: route through ScriptEditorService so an OPEN script editor
+	-- updates LIVE. A direct `script.Source = value` changes the object but does NOT
+	-- refresh an open editor (and can be clobbered when that editor next saves) —
+	-- that's why app→Studio edits didn't appear live with the script open.
+	-- UpdateSourceAsync updates both the object and the open document.
+	if propName == "Source" and typeof(value) == "string" then
+		local okEditor = pcall(function()
+			ScriptEditorService:UpdateSourceAsync(instance, function() return value end)
+		end)
+		if okEditor then return end
+		-- Editor service rejected it (non-script / unsupported state) — fall through
+		-- to a plain assignment below.
+	end
 	-- Skip properties that don't exist on this instance (e.g. an AI-invented
 	-- prop like "Bounce" on a Part) instead of spamming sync warnings.
 	if not pcall(function() return (instance :: any)[propName] end) then
@@ -1153,14 +1169,25 @@ local function connectChangeListener(instance)
 	local conns = {}
 	-- Watch EVERY property: Instance.Changed fires with the property name for any
 	-- property change, so edits to Size/Color/Material/Text/anchored/etc. in
-	-- Studio sync back to the agent — not just Name. (Parent moves are caught by
-	-- the DescendantAdded/Removing tree listeners.)
+	-- Studio sync back to the agent — not just Name.
 	local ok, conn = pcall(function()
 		return instance.Changed:Connect(function(prop)
 			onInstanceChanged(instance, prop)
 		end)
 	end)
 	if ok and conn then table.insert(conns, conn) end
+	-- Reparents: the service DescendantAdded/Removing listeners only catch moves that
+	-- CROSS a watched service; a move WITHIN one (dragging to a new parent, and above
+	-- all GROUPING into a new Model) never fires them, and BasePart.Changed is
+	-- specialised and may not report "Parent". Watch Parent explicitly so grouping
+	-- reliably syncs (flushChanges turns it into a `changedParent` update; a duplicate
+	-- Changed("Parent") is deduped by seen[id], so double-firing is harmless).
+	local okP, connP = pcall(function()
+		return instance:GetPropertyChangedSignal("Parent"):Connect(function()
+			onInstanceChanged(instance, "Parent")
+		end)
+	end)
+	if okP and connP then table.insert(conns, connP) end
 	-- Scripts: Changed doesn't fire for Source (security), so watch it explicitly.
 	if SCRIPT_CLASSES[instance.ClassName] then
 		local ok2, conn2 = pcall(function()
@@ -1575,6 +1602,252 @@ function Playtest.compileCheck()
 		end
 	end
 	return compileErrors, scriptsChecked
+end
+
+-- Answer a server "diagnostics" command: compile-check scripts WITHOUT running the
+-- game (loadstring syntax/load errors only) and POST the errors back. Closes the
+-- edit->error loop without a playtest. Optionally limited to `rootPath`'s subtree.
+-- Declarative — nothing is executed.
+function Playtest.handleDiagnostics(execId, rootPath)
+	local compileErrors = {}
+	local scriptsChecked = 0
+	local scope
+	if type(rootPath) == "string" and rootPath ~= "" then
+		scope = resolveInstancePath(rootPath)
+	end
+	local containers
+	if scope then
+		containers = scope:GetDescendants()
+	else
+		containers = {}
+		for _, svcName in ipairs(Playtest.SCAN_SERVICES) do
+			local okSvc, svc = pcall(game.GetService, game, svcName)
+			if okSvc and svc then
+				for _, d in ipairs(svc:GetDescendants()) do containers[#containers + 1] = d end
+			end
+		end
+	end
+	for i, d in ipairs(containers) do
+		if d:IsA("LuaSourceContainer") then
+			scriptsChecked = scriptsChecked + 1
+			local src
+			local okSrc = pcall(function() src = d.Source end)
+			if okSrc and type(src) == "string" and src ~= "" then
+				local fn, err = loadstring(src, "=" .. d:GetFullName())
+				if not fn then
+					compileErrors[#compileErrors + 1] = { path = d:GetFullName(), error = tostring(err) }
+				end
+			end
+		end
+		if i % 200 == 0 then task.wait() end
+	end
+	local payload = { compileErrors = compileErrors, scriptsChecked = scriptsChecked, clean = #compileErrors == 0 }
+	pcall(function()
+		httpPost("/exec-result", { execId = execId, ok = true, output = HttpService:JSONEncode(payload), sessionId = sessionId })
+	end)
+end
+
+-- Answer a server "query" command: a TARGETED physical fact about the live world —
+-- the cheap alternative to a playtest. Modes: "inspect" (bounding box, world
+-- extents, overlap/"stuck" check, visibility flags), "raycast" (first solid hit
+-- from origin along direction), "distance" (between two instances/points).
+-- Declarative read — runs at plugin identity, never agent-supplied code.
+function Playtest.handleQuery(execId, args)
+	local function fail(msg)
+		pcall(function()
+			httpPost("/exec-result", { execId = execId, ok = false, output = tostring(msg), sessionId = sessionId })
+		end)
+	end
+	if type(args) ~= "table" then return fail("query: args table required") end
+	local mode = type(args.mode) == "string" and args.mode or "inspect"
+
+	-- World-space bounding box for any instance: Model:GetBoundingBox, else the
+	-- part's own CFrame/Size, else the union of descendant BaseParts.
+	local function boundingBox(inst)
+		if inst:IsA("Model") then
+			local ok, cf, size = pcall(function() return inst:GetBoundingBox() end)
+			if ok and cf then return cf, size end
+		end
+		if inst:IsA("BasePart") then return inst.CFrame, inst.Size end
+		local minV, maxV
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("BasePart") then
+				local p = d.Position
+				minV = minV and Vector3.new(math.min(minV.X, p.X), math.min(minV.Y, p.Y), math.min(minV.Z, p.Z)) or p
+				maxV = maxV and Vector3.new(math.max(maxV.X, p.X), math.max(maxV.Y, p.Y), math.max(maxV.Z, p.Z)) or p
+			end
+		end
+		if minV then return CFrame.new((minV + maxV) / 2), (maxV - minV) end
+		return nil, nil
+	end
+	local function vec(v) return { x = v.X, y = v.Y, z = v.Z } end
+
+	if mode == "raycast" then
+		if type(args.origin) ~= "table" then return fail("query raycast: origin {x,y,z} required") end
+		local origin = Vector3.new(args.origin.x or 0, args.origin.y or 0, args.origin.z or 0)
+		local dir = args.direction and Vector3.new(args.direction.x or 0, args.direction.y or 0, args.direction.z or 0) or Vector3.new(0, -1, 0)
+		if dir.Magnitude == 0 then dir = Vector3.new(0, -1, 0) end
+		if dir.Magnitude < 1.5 then dir = dir.Unit * 1000 end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		local result = workspace:Raycast(origin, dir, params)
+		local payload
+		if result then
+			payload = {
+				hit = true,
+				path = result.Instance and result.Instance:GetFullName() or nil,
+				className = result.Instance and result.Instance.ClassName or nil,
+				position = vec(result.Position),
+				distance = (result.Position - origin).Magnitude,
+				normal = vec(result.Normal),
+				material = tostring(result.Material),
+			}
+		else
+			payload = { hit = false }
+		end
+		pcall(function()
+			httpPost("/exec-result", { execId = execId, ok = true, output = HttpService:JSONEncode(payload), sessionId = sessionId })
+		end)
+		return
+	end
+
+	if mode == "distance" then
+		local function pointOf(pathArg, originArg)
+			if type(pathArg) == "string" and pathArg ~= "" then
+				local inst = resolveInstancePath(pathArg)
+				if inst then local cf = boundingBox(inst); if cf then return cf.Position end end
+			end
+			if type(originArg) == "table" then return Vector3.new(originArg.x or 0, originArg.y or 0, originArg.z or 0) end
+			return nil
+		end
+		local a = pointOf(args.path, args.origin)
+		local b = pointOf(args.target, args.direction)
+		if not a or not b then return fail("query distance: need two of path/target/origin points") end
+		pcall(function()
+			httpPost("/exec-result", { execId = execId, ok = true, output = HttpService:JSONEncode({ distance = (a - b).Magnitude, a = vec(a), b = vec(b) }), sessionId = sessionId })
+		end)
+		return
+	end
+
+	-- default: inspect
+	if type(args.path) ~= "string" or args.path == "" then return fail("query inspect: path (string) required") end
+	local inst = resolveInstancePath(args.path)
+	if not inst then return fail("query inspect: target path not found: " .. tostring(args.path)) end
+	local cf, size = boundingBox(inst)
+	local payload = {
+		path = inst:GetFullName(),
+		name = inst.Name,
+		className = inst.ClassName,
+	}
+	if cf and size then
+		payload.position = vec(cf.Position)
+		payload.size = vec(size)
+		payload.extentsMin = vec(cf.Position - size / 2)
+		payload.extentsMax = vec(cf.Position + size / 2)
+		-- Overlap / "stuck" check: parts intersecting this volume that aren't the
+		-- target or its own descendants. A non-empty list flags clipping/overlap.
+		local params = OverlapParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { inst }
+		local overlaps = {}
+		local ok, hits = pcall(function() return workspace:GetPartBoundsInBox(cf, size, params) end)
+		if ok and hits then
+			for _, h in ipairs(hits) do
+				overlaps[#overlaps + 1] = h:GetFullName()
+				if #overlaps >= 10 then break end
+			end
+		end
+		payload.overlaps = overlaps
+		payload.overlapping = #overlaps > 0
+	end
+	if inst:IsA("BasePart") then
+		payload.transparency = inst.Transparency
+		payload.canCollide = inst.CanCollide
+		payload.anchored = inst.Anchored
+		payload.visible = inst.Transparency < 1
+	elseif inst:IsA("GuiObject") then
+		payload.visible = inst.Visible
+	end
+	pcall(function()
+		httpPost("/exec-result", { execId = execId, ok = true, output = HttpService:JSONEncode(payload), sessionId = sessionId })
+	end)
+end
+
+-- Patterns that flag an inserted asset as unsafe. Toolbox/Creator-Store models are
+-- a classic backdoor vector (loadstring(game:HttpGet(url)) loaders, remote require()
+-- injectors, obfuscated blobs). We scan BEFORE parenting and refuse to insert
+-- anything that matches.
+Playtest.MALWARE_PATTERNS = {
+	{ name = "loadstring", pat = "loadstring%s*%(" },
+	{ name = "HttpGet", pat = "HttpGet" },
+	{ name = "HttpGetAsync", pat = "HttpGetAsync" },
+	{ name = "GetAsync", pat = ":GetAsync%s*%(" },
+	{ name = "remote require", pat = "require%s*%(%s*%d%d%d%d+" },
+	{ name = "getfenv", pat = "getfenv%s*%(" },
+	{ name = "setfenv", pat = "setfenv%s*%(" },
+	{ name = "bytecode blob", pat = "\27Lua" },
+	{ name = "char obfuscation", pat = "string%.char%s*%([%d%s,]+%)" },
+	{ name = "exploit marker", pat = "syn%.[a-zA-Z]" },
+}
+
+-- Answer a server "insert_asset" command: load a Creator-Store asset by id via
+-- InsertService, scan every script it carries against MALWARE_PATTERNS, and only
+-- parent it if clean. Otherwise destroy it and return the findings.
+function Playtest.handleInsertAsset(execId, assetId, parentPath)
+	local function fail(msg, extra)
+		local body = { execId = execId, ok = false, output = type(extra) == "table" and HttpService:JSONEncode(extra) or tostring(msg), sessionId = sessionId }
+		pcall(function() httpPost("/exec-result", body) end)
+	end
+	assetId = tonumber(assetId)
+	if not assetId or assetId <= 0 then return fail("insert_asset: a positive assetId is required") end
+
+	local InsertService = game:GetService("InsertService")
+	local ok, loaded = pcall(function() return InsertService:LoadAsset(assetId) end)
+	if not ok or not loaded then
+		return fail("insert_asset: LoadAsset failed (asset may be private, off-sale, or not a model): " .. tostring(loaded))
+	end
+
+	-- Scan all scripts the asset carries before it touches the place.
+	local findings = {}
+	for _, d in ipairs(loaded:GetDescendants()) do
+		if d:IsA("LuaSourceContainer") then
+			local src
+			local okSrc = pcall(function() src = d.Source end)
+			if okSrc and type(src) == "string" and src ~= "" then
+				for _, rule in ipairs(Playtest.MALWARE_PATTERNS) do
+					if string.find(src, rule.pat) then
+						findings[#findings + 1] = { path = d:GetFullName(), pattern = rule.name }
+					end
+				end
+			end
+		end
+	end
+
+	if #findings > 0 then
+		pcall(function() loaded:Destroy() end)
+		return fail("blocked", { blocked = true, reason = "malware scan flagged the asset; not inserted", findings = findings })
+	end
+
+	-- Clean: parent it (default Workspace) and report what landed. LoadAsset returns
+	-- a Model wrapper; move its children into the target so we don't leave an extra
+	-- wrapper Model around.
+	local parent = nil
+	if type(parentPath) == "string" and parentPath ~= "" then parent = resolveInstancePath(parentPath) end
+	if not parent then parent = workspace end
+	local inserted = {}
+	for _, child in ipairs(loaded:GetChildren()) do
+		child.Parent = parent
+		inserted[#inserted + 1] = { path = child:GetFullName(), name = child.Name, className = child.ClassName }
+	end
+	pcall(function() loaded:Destroy() end)
+	pcall(function()
+		httpPost("/exec-result", {
+			execId = execId,
+			ok = true,
+			output = HttpService:JSONEncode({ inserted = inserted, parent = parent:GetFullName(), scanned = true }),
+			sessionId = sessionId,
+		})
+	end)
 end
 
 ---------------------------------------------------------------------------
@@ -2229,9 +2502,25 @@ local function flushChanges()
 			seen[id] = { id = id, changedProperties = {} }
 			table.insert(updated, seen[id])
 		end
-		local serialized = serializeProperty(change.instance, change.property)
-		if serialized ~= nil then
-			seen[id].changedProperties[change.property] = serialized
+		if change.property == "Parent" then
+			-- A reparent (most importantly GROUPING instances into a new Model). The
+			-- service-level DescendantAdded/Removing listeners MISS moves that stay
+			-- under the same watched service, so the instance's own Changed("Parent")
+			-- is the only signal — translate it into an explicit reparent the desktop
+			-- applies to its mirror. Resolve the new parent's id; skip if it isn't
+			-- tracked (moved under something we don't mirror). A cross-service move is
+			-- unregistered by DescendantRemoving before this runs, so `id` is nil there
+			-- and this branch never double-handles it.
+			local parent = change.instance.Parent
+			local parentId = parent and instanceToId[parent] or nil
+			if parentId then
+				seen[id].changedParent = parentId
+			end
+		else
+			local serialized = serializeProperty(change.instance, change.property)
+			if serialized ~= nil then
+				seen[id].changedProperties[change.property] = serialized
+			end
 		end
 		work = work + 1
 		if work % 200 == 0 then task.wait() end -- keep Studio responsive on big batches
@@ -2735,6 +3024,18 @@ local function startPolling()
 						handledExec[cmd.execId] = true
 						local dur, md, pid = cmd.duration, cmd.mode, cmd.playtestId
 						task.spawn(function() Playtest.handlePlaytest(cmd.execId, dur, md, pid) end)
+					elseif cmd.kind == "query" and cmd.execId and not handledExec[cmd.execId] then
+						handledExec[cmd.execId] = true
+						local qargs = { mode = cmd.mode, path = cmd.path, target = cmd.target, origin = cmd.origin, direction = cmd.direction }
+						task.spawn(function() Playtest.handleQuery(cmd.execId, qargs) end)
+					elseif cmd.kind == "diagnostics" and cmd.execId and not handledExec[cmd.execId] then
+						handledExec[cmd.execId] = true
+						local rp = cmd.rootPath
+						task.spawn(function() Playtest.handleDiagnostics(cmd.execId, rp) end)
+					elseif cmd.kind == "insert_asset" and cmd.execId and not handledExec[cmd.execId] then
+						handledExec[cmd.execId] = true
+						local aid, pp = cmd.assetId, cmd.parentPath
+						task.spawn(function() Playtest.handleInsertAsset(cmd.execId, aid, pp) end)
 					end
 				end
 			else
